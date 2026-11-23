@@ -1,0 +1,860 @@
+﻿"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { createClient } from "@/app/utils/supabase";
+import TaskCommentsModal from "@/app/components/TaskCommentsModal";
+import { PERIODS, TASK_STATUSES, STATUS_COLORS, type TaskPeriod } from "@/app/utils/constants";
+import { buildPlanPrompt, parseAiJson, matchMemberId, type AiKpi, type AiGoal } from "@/app/utils/aiImport";
+import { calculateSmartDistribution, type NeedsTimelineItem, type DistributeTask } from "@/app/utils/autoDistribute";
+import {
+  Target, Plus, X, Loader2, Filter, Trash2, Sparkles, CheckCircle2, AlertTriangle,
+  Upload, MessageSquare, Users, Pencil, Bell, Clock,
+  List, Calendar as CalendarIcon, LayoutGrid, ChevronLeft, ChevronRight, AlertCircle, Wand2, Link as LinkIcon, ChevronDown, Lock, Unlock
+} from "lucide-react";
+
+type Profile = { id: string; full_name: string | null; role: string | null; can_approve: boolean | null };
+type Task = {
+  id: string; title: string; description: string | null; assigned_to: string | null;
+  weight: number | null; period: string | null; due_date: string | null; status: string;
+  dependency: string | null; created_at: string; start_date: string | null; recurrence_rule: string | null;
+  notes: string | null; task_type?: string;
+};
+type TaskHelper = { task_id: string; profile_id: string };
+type TaskComment = { id: string; task_id: string; content: string };
+
+type ReviewRow = {
+  key: number; include: boolean; title: string; assignee_id: string; assignee_raw: string;
+  period: TaskPeriod; weight: 1 | 2 | 3; due_date: string; dependency: string; notes: string;
+};
+
+const EDITABLE_STATUSES = ["To Do", "In Progress", "Blocked"];
+const PERIOD_DEFAULT_DATES: Record<string, string> = { Q1: "2027-02-28T17:00", Q2: "2027-05-31T17:00", Q3: "2027-08-31T17:00", Q4: "2027-11-30T17:00" };
+const inputCls = "w-full bg-slate-950 border border-slate-800 rounded-lg py-1.5 px-2 text-sm text-white focus:outline-none focus:border-blue-500";
+const formCls = "w-full bg-slate-950 border border-slate-800 rounded-lg py-2.5 px-4 text-white focus:outline-none focus:border-blue-500";
+
+function dupKey(title: string, period: string | null): string {
+  const t = title.trim().toLowerCase();
+  const p = period ?? "N/A";
+  return t + "|" + p;
+}
+
+function getTimelineColor(task: Task) {
+  if (!task.due_date) return { text: "No deadline", color: "text-slate-500", bg: "bg-slate-800", priority: 5 };
+  if (task.status === "Verified") return { text: "Completed", color: "text-emerald-500", bg: "bg-emerald-500/20", priority: 6 };
+  if (task.status === "Pending Evidence") return { text: "Awaiting Approval", color: "text-blue-400", bg: "bg-blue-500/20", priority: 5 };
+  const start = new Date(task.start_date || task.created_at).getTime();
+  const due = new Date(task.due_date).getTime();
+  const now = new Date().getTime();
+  const totalTime = due - start;
+  const timeLeft = due - now;
+  if (timeLeft < 0) return { text: "Overdue", color: "text-red-500 font-bold", bg: "bg-red-500/20", priority: 1 };
+  const ratio = timeLeft / totalTime;
+  if (ratio <= 0.25) return { text: "Critical", color: "text-red-500", bg: "bg-red-500/20", priority: 2 };
+  if (ratio <= 0.50) return { text: "Approaching Halfway", color: "text-orange-500", bg: "bg-orange-500/20", priority: 3 };
+  return { text: "On Track", color: "text-emerald-500", bg: "bg-emerald-500/20", priority: 4 };
+}
+
+function formatCountdown(dueDateStr: string | null, status: string) {
+  if (!dueDateStr) return "";
+  if (status === "Verified" || status === "Pending Evidence") return "";
+  const due = new Date(dueDateStr).getTime();
+  const now = new Date().getTime();
+  const diff = due - now;
+  if (diff < 0) return "Time expired";
+  const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+  const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+  const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+  if (days > 0) return days + "d " + hours + "h left";
+  if (hours > 0) return hours + "h " + minutes + "m left";
+  return minutes + "m left";
+}
+
+function isTaskOnDate(task: Task, targetDate: Date) {
+  if (!task.due_date) return false;
+  const due = new Date(task.due_date);
+  if (due.toDateString() === targetDate.toDateString()) return true;
+  if (!task.recurrence_rule) return false;
+  if (targetDate < new Date(due.getFullYear(), due.getMonth(), due.getDate())) return false;
+
+  if (task.recurrence_rule === "weekly") {
+    const diffTime = targetDate.getTime() - due.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    if (diffDays > 0 && diffDays % 7 === 0) return true;
+  }
+  if (task.recurrence_rule === "monthly") {
+    if (targetDate.getDate() === due.getDate() && targetDate > due) return true;
+  }
+  if (task.recurrence_rule === "quarterly") {
+    if (targetDate.getDate() === due.getDate() && (targetDate.getMonth() - due.getMonth()) % 3 === 0 && targetDate > due) return true;
+  }
+  return false;
+}
+
+export default function PlanPage() {
+  const supabase = createClient();
+  const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [me, setMe] = useState<Profile | null>(null);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [helpers, setHelpers] = useState<TaskHelper[]>([]);
+  const [load, setLoad] = useState<Record<string, number>>({});
+  const [comments, setComments] = useState<TaskComment[]>([]);
+  
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [isDistributing, setIsDistributing] = useState(false);
+
+  const [view, setView] = useState<"list" | "calendar" | "roadmap">("list");
+  const [calendarMode, setCalendarMode] = useState<"personal" | "team">("personal");
+  const [taskTypeFilter, setTaskTypeFilter] = useState<"all" | "plan" | "project" | "ad_hoc">("all");
+  const [personalDates, setPersonalDates] = useState<Record<string, string>>({});
+  
+  const [filters, setFilters] = useState<{ period: string; status: string; assignee: string }>({ period: "all", status: "all", assignee: "all" });
+  
+  const [currentDate, setCurrentDate] = useState(new Date(2027, 0, 1));
+
+  useEffect(() => {
+    setCurrentDate(new Date());
+  }, []);
+
+  // AI Import State
+  const [pasteText, setPasteText] = useState("");
+  const [rows, setRows] = useState<ReviewRow[]>([]);
+  const [parsedKeys, setParsedKeys] = useState<any[]>([]);
+  const [parsedGoals, setParsedGoals] = useState<AiGoal[]>([]);
+  const [parsedKpis, setParsedKpis] = useState<AiKpi[]>([]);
+  const [showLinker, setShowLinker] = useState(false);
+  const [importing, setImporting] = useState(false);
+  
+  // Manual Linker: Key Number -> Goal
+  const [goalKeyLinks, setGoalKeyLinks] = useState<Record<string, string>>({});
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [form, setForm] = useState({ title: "", assigned_to: "", weight: "2", period: "Q1", due_date: PERIOD_DEFAULT_DATES["Q1"], is_recurring: false, recurrence_rule: "weekly" });
+  
+  const [editTask, setEditTask] = useState<Task | null>(null);
+  const [editForm, setEditForm] = useState({ period: "Q1", due_date: "", is_recurring: false, recurrence_rule: "weekly", assigned_to: "" });
+
+  const [evidenceTask, setEvidenceTask] = useState<Task | null>(null);
+  const [evidenceLink, setEvidenceLink] = useState("");
+  const [evidenceComment, setEvidenceComment] = useState("");
+  const [submittingEvidence, setSubmittingEvidence] = useState(false);
+  const [activeTaskForComments, setActiveTaskForComments] = useState<Task | null>(null);
+
+  const [needsTimeline, setNeedsTimeline] = useState<NeedsTimelineItem[]>([]);
+  const [showTimelineModal, setShowTimelineModal] = useState(false);
+  const [timelineDraft, setTimelineDraft] = useState<Record<string, { period: TaskPeriod; due_date: string }>>({});
+
+  const canManage = me?.role === "manager" || me?.can_approve === true;
+  const isManager = me?.role === "manager";
+
+  useEffect(() => {
+    if (filters.period === "Q1") setCurrentDate(new Date(2027, 0, 1));
+    else if (filters.period === "Q2") setCurrentDate(new Date(2027, 3, 1));
+    else if (filters.period === "Q3") setCurrentDate(new Date(2027, 6, 1));
+    else if (filters.period === "Q4") setCurrentDate(new Date(2027, 9, 1));
+  }, [filters.period]);
+
+  const fetchAll = async () => {
+    setLoading(true); setError(null);
+    const { data: { session } } = await supabase.auth.getSession(); const userId = session?.user?.id ?? null;
+
+    const profRes = await supabase.from("profiles").select("id, full_name, role, can_approve").order("full_name");
+    if (!profRes.error) {
+      const uniqueList = Array.from(new Map(((profRes.data as Profile[]) ?? []).map((p) => [p.id, p])).values());
+      setProfiles(uniqueList); setMe(userId ? uniqueList.find((p) => p.id === userId) ?? null : null);
+    }
+    const taskRes = await supabase.from("tasks").select("*").order("created_at", { ascending: false });
+    if (!taskRes.error) setTasks((taskRes.data as Task[] | null) ?? []);
+
+    const helperRes = await supabase.from("task_assignees").select("*");
+    if (!helperRes.error) setHelpers((helperRes.data as TaskHelper[] | null) ?? []);
+
+    const commentRes = await supabase.from("task_comments").select("id, task_id, content");
+    if (!commentRes.error) setComments((commentRes.data as TaskComment[] | null) ?? []);
+
+    const openRes = await supabase.from("tasks").select("id, assigned_to, weight, status").neq("status", "Verified");
+    if (!openRes.error) {
+      const map: Record<string, number> = {};
+      const openTasks = (openRes.data as { id: string, assigned_to: string | null; weight: number | null }[] | null) ?? [];
+      for (const t of openTasks) {
+        const taskHelpers = (helperRes.data as TaskHelper[] | null)?.filter(h => h.task_id === t.id) ?? [];
+        const totalPeople = (t.assigned_to ? 1 : 0) + taskHelpers.length;
+        if (totalPeople === 0) continue;
+        const splitWeight = (t.weight ?? 0) / totalPeople;
+        if (t.assigned_to) map[t.assigned_to] = (map[t.assigned_to] ?? 0) + splitWeight;
+        for (const h of taskHelpers) map[h.profile_id] = (map[h.profile_id] ?? 0) + splitWeight;
+      }
+      for (const key in map) map[key] = Math.round(map[key] * 10) / 10;
+      setLoad(map);
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => { fetchAll(); }, []);
+
+  const nameOf = (id: string | null): string => (!id ? "Unassigned" : profiles.find((p) => p.id === id)?.full_name ?? "Unknown");
+  const memberLabel = (p: Profile): string => {
+    const name = p.full_name ?? p.id.slice(0, 8);
+    const w = load[p.id] ?? 0;
+    return name + " (wt " + w + ")";
+  };
+
+  const getDependencyDisplay = (dep: string | null) => {
+    if (!dep) return null;
+    if (dep.startsWith("KPI:")) {
+      const id = dep.replace("KPI:", "");
+      const kpi = tasks.find(t => t.id === id);
+      return kpi ? "Target: " + kpi.title : "Target: Unknown";
+    }
+    return dep;
+  };
+
+  const handleParse = () => {
+    setError(null); setNotice(null);
+    try {
+      const result = parseAiJson(pasteText);
+      if (result.tasks.length === 0 && result.goals.length === 0) { setError("The reply contained no tasks or goals."); return; }
+      
+      setParsedKeys(result.key_numbers || []);
+      setParsedGoals(result.goals || []);
+      setParsedKpis(result.kpis || []);
+      
+      const extractedTasks: ReviewRow[] = [];
+      result.tasks.forEach((t, i) => {
+        let finalDate = t.due_date;
+        if (!finalDate && PERIOD_DEFAULT_DATES[t.period || ""]) finalDate = PERIOD_DEFAULT_DATES[t.period || ""];
+        extractedTasks.push({
+          key: i, include: true, title: t.title, assignee_id: matchMemberId(t.assignee || "", profiles), assignee_raw: t.assignee || "",
+          period: (t.period || "Q1") as TaskPeriod, weight: (t.weight || 2) as 1 | 2 | 3, due_date: finalDate || "", dependency: t.kpi_title || "", notes: t.description || "",
+        });
+      });
+
+      setRows(extractedTasks); 
+      setShowLinker(true);
+      
+      // Initialize manual linker drafts
+      const initialLinks: Record<string, string> = {};
+      result.goals.forEach(g => { initialLinks[g.title] = ""; });
+      setGoalKeyLinks(initialLinks);
+
+      setNotice("Detected " + (result.key_numbers?.length || 0) + " Key Numbers, " + result.goals.length + " Goals, " + result.kpis.length + " KPIs, and " + extractedTasks.length + " Tasks.");
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+  };
+
+  const updateRow = (key: number, patch: Partial<ReviewRow>) => setRows((prev) => prev.map((r) => (r.key === key ? { ...r, ...patch } : r)));
+
+  const handleImport = async () => {
+    setImporting(true); setError(null);
+    
+    // 1. Save Key Numbers
+    const keyIdMap: Record<string, string> = {};
+    if (parsedKeys.length > 0) {
+      const { data: insertedKeys, error: keyErr } = await supabase.from("tasks").insert(parsedKeys.map(k => ({ title: k.title, task_type: "key_number", status: "In Progress", description: k.description || null, notes: k.target ? "Target: " + k.target : null }))).select("id, title");
+      if (keyErr) setError("Warning: Key Numbers could not be saved (" + keyErr.message + ").");
+      else if (insertedKeys) for (const k of insertedKeys) keyIdMap[k.title] = k.id;
+    }
+
+    // 2. Save Goals (linked to Key Numbers via manual selection)
+    const goalIdMap: Record<string, string> = {};
+    if (parsedGoals.length > 0) {
+      const { data: insertedGoals, error: goalErr } = await supabase.from("tasks").insert(parsedGoals.map(g => {
+        const keyTitle = goalKeyLinks[g.title];
+        const keyId = keyIdMap[keyTitle];
+        return { title: g.title.trim(), task_type: "goal", status: "To Do", weight: g.weight || 2, dependency: keyId ? "KEY:" + keyId : null };
+      })).select("id, title");
+      if (goalErr) setError("Warning: Goals could not be saved (" + goalErr.message + ").");
+      else if (insertedGoals) for (const g of insertedGoals) goalIdMap[g.title] = g.id;
+    }
+
+    // 3. Save KPIs (linked to Goals)
+    const kpiIdMap: Record<string, string> = {};
+    if (parsedKpis.length > 0) {
+      const { data: insertedKpis, error: kpiErr } = await supabase.from("tasks").insert(parsedKpis.map(k => {
+        const goalId = k.goal_title ? goalIdMap[k.goal_title] : null;
+        return { title: k.title.trim(), task_type: "kpi", status: "To Do", dependency: goalId ? "GOAL:" + goalId : null };
+      })).select("id, title");
+      if (kpiErr) setError("Warning: Performance Targets could not be saved (" + kpiErr.message + ").");
+      else if (insertedKpis) for (const k of insertedKpis) kpiIdMap[k.title] = k.id;
+    }
+
+    // 4. Save Tasks (linked to KPIs)
+    const existing = new Set(tasks.map((t) => dupKey(t.title, t.period)));
+    const fresh = rows.filter((r) => r.include && r.title.trim() && !existing.has(dupKey(r.title, r.period)));
+    if (fresh.length > 0) {
+      const { error: insErr } = await supabase.from("tasks").insert(fresh.map((r) => {
+        const kpiId = kpiIdMap[r.dependency];
+        return { title: r.title.trim(), task_type: "plan", description: r.notes.trim() || null, assigned_to: r.assignee_id || null, dependency: kpiId ? "KPI:" + kpiId : null, weight: r.weight, period: r.period, due_date: r.due_date || null, status: "To Do" };
+      }));
+      if (insErr) { setError(insErr.message); setImporting(false); return; }
+    }
+
+    setNotice("Successfully imported the full plan.");
+    setRows([]); setPasteText(""); setParsedKeys([]); setParsedGoals([]); setParsedKpis([]); setGoalKeyLinks({}); setShowLinker(false);
+    setImporting(false); fetchAll();
+  };
+
+  const handleDeletePlan = async () => {
+    if (!isManager) return;
+    if (!confirm("Delete ALL plan, KPI, Goal, and Key Number tasks? This will clear the dashboard.")) return;
+    setError(null);
+    await supabase.from("tasks").delete().in("task_type", ["plan", "project", "ad_hoc", "kpi", "goal", "key_number"]);
+    await supabase.from("plan_uploads").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+    fetchAll();
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault(); setSaving(true); setError(null);
+    const assignee = canManage ? form.assigned_to || me?.id || null : me?.id ?? null;
+    const { error: insErr } = await supabase.from("tasks").insert({ title: form.title.trim(), task_type: "plan", assigned_to: assignee, weight: parseInt(form.weight, 10), period: form.period, due_date: form.due_date || null, status: "To Do", start_date: new Date().toISOString(), recurrence_rule: form.is_recurring ? form.recurrence_rule : null });
+    if (insErr) { setError(insErr.message); setSaving(false); return; }
+    setForm({ title: "", assigned_to: "", weight: "2", period: "Q1", due_date: PERIOD_DEFAULT_DATES["Q1"], is_recurring: false, recurrence_rule: "weekly" });
+    setIsModalOpen(false); setSaving(false); fetchAll();
+  };
+
+  const handleEditSubmit = async (e: React.FormEvent) => {
+    e.preventDefault(); if (!editTask) return; setSaving(true); setError(null);
+    const { error: upErr } = await supabase.from("tasks").update({ 
+      period: editForm.period, 
+      due_date: editForm.due_date || null, 
+      recurrence_rule: editForm.is_recurring ? editForm.recurrence_rule : null,
+      assigned_to: canManage ? editForm.assigned_to || null : editTask.assigned_to
+    }).eq("id", editTask.id);
+    if (upErr) { setError(upErr.message); setSaving(false); return; }
+    setEditTask(null); setSaving(false); fetchAll();
+  };
+
+  const updateStatus = async (id: string, status: string) => { setError(null); const { error: upErr } = await supabase.from("tasks").update({ status }).eq("id", id); if (upErr) setError(upErr.message); fetchAll(); };
+
+  const markComplete = async (e: React.FormEvent) => {
+    e.preventDefault(); if (!evidenceTask) return; if (!evidenceLink.trim() && !evidenceComment.trim()) return setError("Provide a link or comment.");
+    
+    setSubmittingEvidence(true); 
+    const { data: { session } } = await supabase.auth.getSession(); 
+    const userId = session?.user?.id;
+    
+    const isManagerOrApprover = me?.role === "manager" || me?.can_approve === true;
+    const newStatus = isManagerOrApprover ? "Verified" : "Pending Evidence";
+
+    if (evidenceLink.trim()) {
+      await supabase.from("evidence").insert({ task_id: evidenceTask.id, evidence_link: evidenceLink.trim(), file_url: evidenceLink.trim(), uploaded_by: userId, verified_by_manager: isManagerOrApprover });
+    }
+    if (evidenceComment.trim()) {
+      await supabase.from("task_comments").insert({ task_id: evidenceTask.id, user_id: userId, content: "[COMPLETION NOTE] " + evidenceComment.trim() });
+    }
+    
+    await supabase.from("tasks").update({ status: newStatus }).eq("id", evidenceTask.id);
+    
+    setEvidenceTask(null); setEvidenceLink(""); setEvidenceComment(""); setSubmittingEvidence(false); fetchAll();
+  };
+
+  const reassign = async (id: string, newAssignee: string) => { if (!canManage) return; setError(null); const { error: upErr } = await supabase.from("tasks").update({ assigned_to: newAssignee || null }).eq("id", id); if (upErr) setError(upErr.message); else if (newAssignee) await supabase.from("task_assignees").delete().eq("task_id", id).eq("profile_id", newAssignee); fetchAll(); };
+  const addHelper = async (taskId: string, helperId: string) => { if (!canManage || !helperId) return; setError(null); const { error: err } = await supabase.from("task_assignees").insert({ task_id: taskId, profile_id: helperId }); if (err) setError(err.message); fetchAll(); };
+  const removeHelper = async (taskId: string, helperId: string) => { if (!canManage) return; setError(null); const { error: err } = await supabase.from("task_assignees").delete().eq("task_id", taskId).eq("profile_id", helperId); if (err) setError(err.message); fetchAll(); };
+
+  const handleAutoDistribute = async () => {
+    if (!me) return;
+    setIsDistributing(true); setError(null); setNotice(null);
+    try {
+      const myTasks = tasks.filter(t => t.assigned_to === me.id);
+      
+      const distributeTasks: DistributeTask[] = myTasks.map(t => ({
+        id: t.id,
+        title: t.title,
+        period: t.period as TaskPeriod,
+        due_date: t.due_date,
+        assigned_to: t.assigned_to
+      }));
+
+      const result = calculateSmartDistribution(distributeTasks, filters.period as any);
+      
+      if (result.updates.length === 0 && result.needsTimeline.length === 0) { 
+        setError("No tasks assigned to you found for " + (filters.period === "all" ? "the year" : filters.period) + "."); 
+        setIsDistributing(false); 
+        return; 
+      }
+      
+      for (const update of result.updates) {
+        await supabase.from("tasks").update({ due_date: update.due_date, period: update.period }).eq("id", update.id);
+      }
+      
+      if (result.updates.length > 0) setNotice("Successfully distributed " + result.updates.length + " of your tasks.");
+      
+      if (result.needsTimeline.length > 0) {
+        setNeedsTimeline(result.needsTimeline);
+        const draft: Record<string, { period: TaskPeriod; due_date: string }> = {};
+        for (const n of result.needsTimeline) draft[n.id] = { period: "Q1", due_date: "" };
+        setTimelineDraft(draft);
+        setShowTimelineModal(true);
+      }
+      
+      fetchAll();
+    } catch (err) { setError("Failed to auto-distribute tasks."); } finally { setIsDistributing(false); }
+  };
+
+  const applyTimelineDrafts = async () => {
+    for (const n of needsTimeline) {
+      const d = timelineDraft[n.id];
+      if (!d || !d.due_date) continue;
+      await supabase.from("tasks").update({ period: d.period, due_date: d.due_date }).eq("id", n.id);
+    }
+    setShowTimelineModal(false);
+    setNeedsTimeline([]);
+    setTimelineDraft({});
+    setNotice("Timeline saved.");
+    fetchAll();
+  };
+
+  const handleRequestChange = async (task: Task) => {
+    setError(null);
+    await supabase.from("task_comments").insert({ task_id: task.id, user_id: me?.id, content: "[PRIORITY CHANGE REQUEST] I would like to change the deadline/priority for this task." });
+    setNotice("Request sent to Manager.");
+    fetchAll();
+  };
+
+  const filtered = useMemo(() => {
+    let result = tasks;
+    if (view === "calendar" && calendarMode === "personal") {
+      result = result.filter(t => t.assigned_to === me?.id);
+    }
+    return result.filter((t) => {
+      if (taskTypeFilter !== "all" && t.task_type !== taskTypeFilter) return false;
+      if (filters.status !== "all" && t.status !== filters.status) return false;
+      if (filters.assignee !== "all" && calendarMode === "team") {
+        if (t.assigned_to !== filters.assignee) return false;
+      }
+      if (filters.period !== "all") {
+        const p = (t.period || "N/A").toUpperCase();
+        if (p !== filters.period) return false;
+      }
+      return true;
+    }).sort((a, b) => {
+      const timeA = getTimelineColor(a); const timeB = getTimelineColor(b);
+      if (timeA.priority !== timeB.priority) return timeA.priority - timeB.priority;
+      if (a.due_date && b.due_date) return new Date(a.due_date).getTime() - new Date(b.due_date).getTime();
+      return 0;
+    });
+  }, [tasks, filters, taskTypeFilter, view, calendarMode, me]);
+
+  const openTaskModal = (t: Task) => {
+    setEditTask(t);
+    setEditForm({ period: t.period || "Q1", due_date: t.due_date ? new Date(t.due_date).toISOString().slice(0, 16) : "", is_recurring: !!t.recurrence_rule, recurrence_rule: t.recurrence_rule || "weekly", assigned_to: t.assigned_to || "" });
+  };
+
+  const nextMonth = () => setCurrentDate(new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 1));
+  const prevMonth = () => setCurrentDate(new Date(currentDate.getFullYear(), currentDate.getMonth() - 1, 1));
+  
+  const year = currentDate.getFullYear();
+  const month = currentDate.getMonth();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const firstDayOfMonth = new Date(year, month, 1).getDay();
+
+  return (
+    <div className="space-y-6 pb-10 max-w-7xl mx-auto">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div>
+          <h1 className="text-3xl font-bold text-white flex items-center gap-3"><Target className="text-blue-500" size={28} /> Task Center &amp; Annual Plan</h1>
+          <p className="text-slate-400 mt-1">Load the ESG plan with AI, then track every task by period, owner and status.</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex bg-slate-900 rounded-xl p-1 border border-slate-800">
+            <button onClick={() => setView("list")} className={"px-3 py-1.5 text-xs font-medium rounded-lg flex items-center gap-2 " + (view === "list" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white")}><List size={14} /> List</button>
+            <button onClick={() => setView("calendar")} className={"px-3 py-1.5 text-xs font-medium rounded-lg flex items-center gap-2 " + (view === "calendar" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white")}><CalendarIcon size={14} /> Calendar</button>
+            <button onClick={() => setView("roadmap")} className={"px-3 py-1.5 text-xs font-medium rounded-lg flex items-center gap-2 " + (view === "roadmap" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white")}><LayoutGrid size={14} /> Roadmap</button>
+          </div>
+          <button onClick={() => setIsModalOpen(true)} className="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-xl transition-all flex items-center gap-2 shadow-lg shadow-blue-900/30"><Plus size={18} /> Add Task</button>
+        </div>
+      </div>
+
+      {error && <div className="p-4 bg-red-500/10 border border-red-500/50 rounded-xl text-red-400 text-sm">{error}</div>}
+      {notice && <div className="p-4 bg-emerald-500/10 border border-emerald-500/40 rounded-xl text-emerald-400 text-sm flex items-center gap-2"><CheckCircle2 size={16} /> {notice}</div>}
+
+      {!showLinker && (
+        <details className="bg-slate-900/80 border border-slate-800 rounded-xl overflow-hidden group">
+          <summary className="p-4 flex items-center justify-between cursor-pointer list-none hover:bg-slate-900 transition-colors">
+            <div className="flex items-center gap-2">
+              <Sparkles size={16} className="text-blue-500" />
+              <span className="text-sm font-medium text-white">Import Plan Data with AI</span>
+            </div>
+            <ChevronDown size={16} className="text-slate-400 group-open:rotate-180 transition-transform" />
+          </summary>
+          <div className="p-4 border-t border-slate-800 space-y-4">
+            <p className="text-xs text-slate-400">Copy the prompt, paste it with your PDF text into any AI, then paste the resulting JSON here.</p>
+            <div className="flex gap-2">
+              <button onClick={async () => { await navigator.clipboard.writeText(buildPlanPrompt(profiles)); setNotice("Prompt copied!"); }} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-white text-xs rounded-lg flex items-center gap-1"><LinkIcon size={12} /> Copy Prompt</button>
+            </div>
+            <textarea rows={3} value={pasteText} onChange={(e) => setPasteText(e.target.value)} className={formCls} placeholder="Paste the JSON output here..." />
+            <button onClick={handleParse} disabled={!pasteText.trim()} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium rounded-lg disabled:opacity-50">Read Data</button>
+          </div>
+        </details>
+      )}
+
+      {showLinker && (
+        <div className="bg-slate-900/80 border border-blue-500/30 rounded-xl p-4 space-y-4">
+          <div className="flex justify-between items-center">
+            <h3 className="text-sm font-semibold text-white">Verify Linkages</h3>
+            <button onClick={() => setShowLinker(false)} className="text-xs text-slate-400 hover:text-white">Cancel</button>
+          </div>
+          
+          <div className="bg-slate-950 p-4 rounded-lg border border-slate-800">
+            <h4 className="text-xs font-semibold text-blue-400 mb-3 uppercase tracking-wider">Link Goals to Key Numbers</h4>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {parsedGoals.map((goal, idx) => (
+                <div key={idx} className="p-3 bg-slate-900 border border-slate-800 rounded-lg flex items-center justify-between gap-4">
+                  <span className="text-xs text-white font-medium flex-1">{goal.title}</span>
+                  <select 
+                    value={goalKeyLinks[goal.title] || ""} 
+                    onChange={(e) => setGoalKeyLinks(prev => ({ ...prev, [goal.title]: e.target.value }))} 
+                    className={inputCls + " max-w-[200px]"}
+                  >
+                    <option value="">-- Select Key Number --</option>
+                    {parsedKeys.map(k => <option key={k.title} value={k.title}>{k.title}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="max-h-60 overflow-y-auto border border-slate-800 rounded-lg">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-950 sticky top-0 text-slate-400"><tr><th className="px-2 py-1">Use</th><th className="px-2 py-1">Task</th><th className="px-2 py-1">KPI (Target)</th><th className="px-2 py-1">Assignee</th></tr></thead>
+              <tbody className="divide-y divide-slate-800">
+                {rows.map((r) => (
+                  <tr key={r.key}>
+                    <td className="px-2 py-1"><input type="checkbox" checked={r.include} onChange={(e) => updateRow(r.key, { include: e.target.checked })} /></td>
+                    <td className="px-2 py-1 text-slate-200">{r.title}</td>
+                    <td className="px-2 py-1 text-blue-400">{r.dependency}</td>
+                    <td className="px-2 py-1 text-slate-400">{nameOf(r.assignee_id)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <button onClick={handleImport} disabled={importing || rows.filter(r=>r.include).length === 0} className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg flex items-center justify-center gap-2 disabled:opacity-50">
+            {importing ? <Loader2 className="animate-spin" size={16} /> : <CheckCircle2 size={16} />} Confirm & Import
+          </button>
+        </div>
+      )}
+
+      <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-3 space-y-3">
+        <div className="flex flex-wrap gap-2">
+          {(["all", "plan", "project", "ad_hoc"] as const).map(f => (
+            <button key={f} onClick={() => setTaskTypeFilter(f)} className={"px-4 py-1.5 text-xs font-medium rounded-lg transition " + (taskTypeFilter === f ? "bg-blue-600 text-white" : "bg-slate-950 text-slate-400 hover:bg-slate-800")}>
+              {f === "all" ? "All My Tasks" : f === "plan" ? "Plan Tasks" : f === "project" ? "Project Tasks" : "Ad-Hoc Tasks"}
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <Filter size={16} className="text-slate-500" />
+            <select value={filters.period} onChange={(e) => setFilters({ ...filters, period: e.target.value })} className="bg-slate-950 border border-slate-800 rounded-lg py-1.5 px-3 text-sm text-white"><option value="all">All Periods</option>{PERIODS.map((p) => <option key={p} value={p}>{p}</option>)}</select>
+            <select value={filters.status} onChange={(e) => setFilters({ ...filters, status: e.target.value })} className="bg-slate-950 border border-slate-800 rounded-lg py-1.5 px-3 text-sm text-white"><option value="all">All Statuses</option>{TASK_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}</select>
+            
+            {(view !== "calendar" || calendarMode === "team") && (
+              <select value={filters.assignee} onChange={(e) => setFilters({ ...filters, assignee: e.target.value })} className="bg-slate-950 border border-slate-800 rounded-lg py-1.5 px-3 text-sm text-white"><option value="all">Everyone</option>{profiles.map((p) => <option key={p.id} value={p.id}>{p.full_name ?? p.id.slice(0, 8)}</option>)}</select>
+            )}
+            
+            <span className="text-xs text-slate-500">{filtered.length} of {tasks.length}</span>
+          </div>
+          {isManager && <button onClick={handleDeletePlan} className="text-sm text-red-400 hover:text-red-300 flex items-center gap-1"><Trash2 size={14} /> Delete Plan</button>}
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="p-12 flex justify-center"><Loader2 className="animate-spin text-blue-500" size={28} /></div>
+      ) : filtered.length === 0 ? (
+        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-12 text-center">
+          <Target className="mx-auto text-slate-700 mb-3" size={40} />
+          <p className="text-slate-400">No tasks found for this filter.</p>
+          {filters.period !== "all" && <p className="text-sm text-slate-500 mt-2">Try selecting "All Periods" to see all your tasks.</p>}
+        </div>
+      ) : view === "list" && (
+        <div className="grid grid-cols-1 gap-3">
+          {filtered.map((t) => {
+            const statusEditable = EDITABLE_STATUSES.includes(t.status); const timeline = getTimelineColor(t); const countdown = formatCountdown(t.due_date, t.status);
+            const taskHelpers = helpers.filter(h => h.task_id === t.id); const taskComments = comments.filter(c => c.task_id === t.id);
+            const hasHelpRequest = taskComments.some(c => c.content.startsWith("[HELP REQUESTED]"));
+            const latestReassign = taskComments.find(c => c.content.startsWith("[REASSIGNED]") || c.content.startsWith("[HELP ASSIGNED]"));
+            const depDisplay = getDependencyDisplay(t.dependency);
+            const isLocked = t.notes?.includes("[LOCKED]");
+            
+            return (
+              <div key={t.id} className={"bg-slate-900/80 backdrop-blur-sm border rounded-xl p-5 transition-colors flex flex-col md:flex-row gap-5 " + (hasHelpRequest ? "border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.1)]" : "border-slate-800 hover:border-blue-500/30")}>
+                <div className="flex-1">
+                  <div className="flex flex-wrap items-center gap-2 mb-2">
+                    <span className={"text-xs px-2 py-0.5 rounded-full border " + (STATUS_COLORS[t.status] ?? "")}>{t.status}</span>
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">Weight {t.weight ?? "-"}</span>
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">{t.period || "N/A"}</span>
+                    {t.recurrence_rule && <span className="text-xs px-2 py-0.5 rounded-full bg-blue-900/40 text-blue-400">Recurs: {t.recurrence_rule}</span>}
+                    <span className={"text-xs px-2 py-0.5 rounded-full border border-slate-800 " + timeline.bg + " " + timeline.color}>{timeline.text}</span>
+                    {countdown && <span className="text-xs px-2 py-0.5 rounded-full bg-slate-950 border border-slate-800 text-slate-300 flex items-center gap-1"><Clock size={12} /> {countdown}</span>}
+                    <button onClick={() => openTaskModal(t)} className="ml-auto text-slate-400 hover:text-white flex items-center gap-1 text-xs"><Pencil size={12} /> Edit Details</button>
+                  </div>
+                  <h3 className="font-medium text-white text-lg">{t.title}</h3>
+                  {t.description && <p className="text-sm text-slate-400 mt-1">{t.description}</p>}
+                  {depDisplay && <p className="text-xs text-blue-400 mt-2 font-medium">ðŸ”— {depDisplay}</p>}
+                  <div className="mt-4 flex flex-wrap items-center gap-2">
+                    <button onClick={() => setActiveTaskForComments(t)} className={"px-3 py-1.5 text-xs rounded-lg flex items-center gap-1 " + (hasHelpRequest ? "bg-red-500/20 text-red-400 hover:bg-red-500/30" : "bg-slate-800 text-slate-300 hover:bg-slate-700")}><MessageSquare size={14} /> Comments ({taskComments.length}){hasHelpRequest && <span className="ml-1 text-red-400 font-bold">!</span>}</button>
+                    {(t.status === "In Progress" || t.status === "Blocked" || t.status === "Pending Evidence") && (
+                      <button onClick={() => setEvidenceTask(t)} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs rounded-lg flex items-center gap-1 font-medium shadow-lg shadow-emerald-900/20"><CheckCircle2 size={14} /> {t.status === "Pending Evidence" ? "Upload Evidence" : "Mark Complete"}</button>
+                    )}
+                    {isLocked && !canManage && (
+                      <button onClick={() => handleRequestChange(t)} className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs rounded-lg flex items-center gap-1 font-medium shadow-lg shadow-amber-900/20">
+                         <Unlock size={14} /> Request Priority Change
+                      </button>
+                    )}
+                    {canManage && (
+                      <div className="flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5">
+                        <Users size={14} className="text-slate-500" /><span className="text-xs text-slate-400">Helpers:</span>
+                        {taskHelpers.map(h => <span key={h.profile_id} className="text-xs text-blue-400 flex items-center gap-1">{nameOf(h.profile_id).split(" ")[0]}<button onClick={() => removeHelper(t.id, h.profile_id)} className="hover:text-red-400"><X size={12} /></button></span>)}
+                        <select className="bg-transparent text-xs text-white focus:outline-none border-l border-slate-700 pl-2 cursor-pointer" onChange={(e) => { if (e.target.value) { addHelper(t.id, e.target.value); e.target.value = ""; } }} defaultValue="">
+                          <option value="" disabled className="bg-slate-900">+ Add</option>
+                          {profiles.filter(p => p.id !== t.assigned_to && !taskHelpers.find(h => h.profile_id === p.id)).map(p => <option key={p.id} value={p.id} className="bg-slate-900">{p.full_name}</option>)}
+                        </select>
+                      </div>
+                    )}
+                  </div>
+                  {latestReassign && <div className="mt-3 p-2 bg-amber-500/10 border border-amber-500/30 rounded-lg text-xs text-amber-400 flex items-center gap-2"><AlertTriangle size={14} /> {latestReassign.content.replace("[REASSIGNED]", "").replace("[HELP ASSIGNED]", "")}</div>}
+                </div>
+                <div className="flex flex-col gap-2 md:w-56 shrink-0">
+                  {canManage ? <select value={t.assigned_to ?? ""} onChange={(e) => reassign(t.id, e.target.value)} className="bg-slate-950 border border-slate-800 rounded-lg py-1.5 px-3 text-sm text-white"><option value="">Unassigned</option>{profiles.map((p) => (<option key={p.id} value={p.id}>{memberLabel(p)} (Primary)</option>))}</select> : <p className="text-sm text-slate-300 bg-slate-950 border border-slate-800 rounded-lg py-1.5 px-3">{nameOf(t.assigned_to)}</p>}
+                  {statusEditable ? <select value={t.status} onChange={(e) => updateStatus(t.id, e.target.value)} className="bg-slate-950 border border-slate-800 rounded-lg py-1.5 px-3 text-sm text-white">{EDITABLE_STATUSES.map((s) => (<option key={s} value={s}>{s}</option>))}</select> : <p className="text-xs text-slate-500 bg-slate-950 border border-slate-800 rounded-lg py-1.5 px-3">{t.status}</p>}
+                  <div className="text-right bg-slate-950 border border-slate-800 rounded-lg p-2"><p className="text-[10px] text-amber-500 font-medium flex items-center justify-end gap-1 mb-1"><AlertCircle size={10}/> My Personal Target</p><input type="date" value={personalDates[t.id] || ""} onChange={(e) => setPersonalDates(prev => ({ ...prev, [t.id]: e.target.value }))} className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white w-full" /></div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {view === "calendar" && !loading && (
+        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
+          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
+            <div className="flex items-center gap-4">
+              <h2 className="text-lg font-semibold text-white">
+                {currentDate.toLocaleString('default', { month: 'long', year: 'numeric' })}
+              </h2>
+              <div className="flex bg-slate-950 rounded-lg p-1 border border-slate-800">
+                <button onClick={() => setCalendarMode("personal")} className={"px-3 py-1 text-xs font-medium rounded " + (calendarMode === "personal" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white")}>My Calendar</button>
+                <button onClick={() => setCalendarMode("team")} className={"px-3 py-1 text-xs font-medium rounded " + (calendarMode === "team" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white")}>Team Calendar</button>
+              </div>
+            </div>
+            
+            <div className="flex items-center gap-3">
+              {calendarMode === "personal" && (
+                <button onClick={handleAutoDistribute} disabled={isDistributing} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg flex items-center gap-2 transition-colors disabled:opacity-50 shadow-lg shadow-indigo-900/20">
+                  {isDistributing ? <Loader2 size={16} className="animate-spin" /> : <Wand2 size={16} />} 
+                  Auto-Distribute My Tasks
+                </button>
+              )}
+              <div className="flex gap-1 bg-slate-950 rounded-lg p-1 border border-slate-800">
+                <button onClick={prevMonth} className="p-1.5 hover:bg-slate-800 rounded text-slate-400 hover:text-white"><ChevronLeft size={16} /></button>
+                <button onClick={nextMonth} className="p-1.5 hover:bg-slate-800 rounded text-slate-400 hover:text-white"><ChevronRight size={16} /></button>
+              </div>
+            </div>
+          </div>
+          
+          <div className="grid grid-cols-7 gap-2 text-center text-xs font-medium text-slate-500 mb-2">
+            <div>Sun</div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div>
+          </div>
+          <div className="grid grid-cols-7 gap-2">
+            {Array.from({ length: firstDayOfMonth }).map((_, i) => <div key={"blank-" + i} className="min-h-[100px] bg-slate-950/20 border border-slate-800/30 rounded-lg" />)}
+            
+            {Array.from({ length: daysInMonth }).map((_, i) => {
+              const dayNumber = i + 1;
+              const currentDayDate = new Date(year, month, dayNumber);
+              
+              const dayTasks = filtered.filter(t => isTaskOnDate(t, currentDayDate));
+              
+              return (
+                <div key={dayNumber} className="min-h-[120px] bg-slate-950/50 border border-slate-800 rounded-lg p-2 flex flex-col gap-1">
+                  <span className="text-xs text-slate-500 font-medium mb-1">{dayNumber}</span>
+                  {dayTasks.map(t => {
+                    const assignee = profiles.find(p => p.id === t.assigned_to);
+                    const teamColor = calendarMode === "team" ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30" : "bg-blue-500/20 text-blue-300 border-blue-500/30";
+                    return (
+                      <div key={t.id} onClick={() => openTaskModal(t)} className={"text-[10px] px-1.5 py-1 rounded cursor-pointer hover:opacity-80 truncate border transition-colors " + teamColor} title={t.title}>
+                        {t.recurrence_rule && <span className="mr-1 inline-block">ðŸ”„</span>}
+                        {calendarMode === "team" && assignee && <span className="font-bold block text-[8px] uppercase">{assignee.full_name?.split(" ")[0]}</span>}
+                        {t.title}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {view === "roadmap" && !loading && (
+        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 space-y-4">
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-lg font-semibold text-white">Priority Roadmap (Weight & Urgency)</h2>
+            <button onClick={handleAutoDistribute} disabled={isDistributing} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg flex items-center gap-2 transition-colors disabled:opacity-50 shadow-lg shadow-indigo-900/20">
+              {isDistributing ? <Loader2 size={16} className="animate-spin" /> : <Wand2 size={16} />} 
+              Auto-Distribute Tasks
+            </button>
+          </div>
+          {filtered.sort((a, b) => getTimelineColor(a).priority - getTimelineColor(b).priority || (b.weight || 1) - (a.weight || 1)).map(t => {
+             const isLocked = t.notes?.includes("[LOCKED]");
+             return (
+              <div key={t.id} onClick={() => openTaskModal(t)} className="flex items-center gap-4 bg-slate-950/50 p-4 rounded-xl border border-slate-800 cursor-pointer hover:border-blue-500/50 transition-colors">
+                <div className={"w-12 h-12 rounded-full flex items-center justify-center font-bold text-lg shrink-0 " + (t.weight === 3 ? "bg-red-500/20 text-red-400" : t.weight === 2 ? "bg-amber-500/20 text-amber-400" : "bg-slate-800 text-slate-400")}>W{t.weight}</div>
+                <div className="flex-1">
+                  <h3 className="text-sm font-medium text-white flex items-center gap-2">
+                    {t.title}
+                    {isLocked && <span title="Schedule Locked"><Lock size={12} className="text-amber-500" /></span>}
+                  </h3>
+                  <p className="text-xs text-slate-500">{t.due_date ? "Due " + new Date(t.due_date).toLocaleDateString() : "No deadline"}</p>
+                </div>
+                <div className={"text-xs font-semibold px-3 py-1 rounded-full border border-slate-800 " + getTimelineColor(t).bg + " " + getTimelineColor(t).color}>{getTimelineColor(t).text}</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {isModalOpen && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg shadow-2xl max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-center p-6 border-b border-slate-800 sticky top-0 bg-slate-900 z-10"><h2 className="text-lg font-semibold text-white">Add Plan Task</h2><button onClick={() => setIsModalOpen(false)} className="text-slate-400 hover:text-white"><X size={20} /></button></div>
+            <form onSubmit={handleSubmit} className="p-6 space-y-4">
+              {error && <div className="p-3 bg-red-500/10 border border-red-500/50 rounded-lg text-red-400 text-sm">{error}</div>}
+              <div><label className="block text-sm font-medium text-slate-300 mb-1">Title *</label><input required value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} className={formCls} /></div>
+              <div className="grid grid-cols-2 gap-3"><div><label className="block text-sm font-medium text-slate-300 mb-1">Period</label><select value={form.period} onChange={(e) => { const newPeriod = e.target.value; setForm({ ...form, period: newPeriod, due_date: PERIOD_DEFAULT_DATES[newPeriod] ?? "" }); }} className={formCls}>{PERIODS.map((p) => <option key={p} value={p}>{p}</option>)}</select></div><div><label className="block text-sm font-medium text-slate-300 mb-1">Weight</label><select value={form.weight} onChange={(e) => setForm({ ...form, weight: e.target.value })} className={formCls}><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></div></div>
+              <div className="grid grid-cols-2 gap-3"><div><label className="block text-sm font-medium text-slate-300 mb-1">Assign To</label><select value={canManage ? form.assigned_to : me?.id ?? ""} disabled={!canManage} onChange={(e) => setForm({ ...form, assigned_to: e.target.value })} className={formCls}>{canManage ? <option value="">Me</option> : null}{profiles.map((p) => <option key={p.id} value={p.id}>{memberLabel(p)}</option>)}</select></div><div><label className="block text-sm font-medium text-slate-300 mb-1">Due Date</label><input type="datetime-local" value={form.due_date} onChange={(e) => setForm({ ...form, due_date: e.target.value })} className={formCls} /></div></div>
+              <div className="flex gap-3 pt-2"><button type="button" onClick={() => setIsModalOpen(false)} className="flex-1 py-2.5 bg-slate-800 text-white rounded-lg font-medium">Cancel</button><button type="submit" disabled={saving} className="flex-1 py-2.5 bg-blue-600 text-white rounded-lg font-medium disabled:opacity-50">{saving ? <Loader2 className="animate-spin" size={18} /> : "Save"}</button></div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {editTask && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg shadow-2xl p-6 space-y-4">
+            <div className="flex justify-between items-start">
+              <h2 className="text-lg font-semibold text-white pr-4">{editTask.title}</h2>
+              <button onClick={() => setEditTask(null)} className="text-slate-400 hover:text-white mt-1"><X size={20} /></button>
+            </div>
+            
+            {editTask.description && <p className="text-sm text-slate-400">{editTask.description}</p>}
+            
+            <div className="grid grid-cols-2 gap-3 pt-2">
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Status</label>
+                <select 
+                  value={editTask.status} 
+                  onChange={(e) => {
+                    updateStatus(editTask.id, e.target.value);
+                    setEditTask({...editTask, status: e.target.value});
+                  }} 
+                  className={formCls}
+                >
+                  {["To Do", "In Progress", "Blocked", "Pending Evidence", "Verified"].map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Due Date</label>
+                <input type="datetime-local" value={editForm.due_date} onChange={(e) => setEditForm({ ...editForm, due_date: e.target.value })} className={formCls} />
+              </div>
+            </div>
+
+            {canManage && (
+              <div className="pt-2">
+                <label className="block text-xs font-medium text-slate-400 mb-1">Assignee (Start on behalf of)</label>
+                <select value={editForm.assigned_to} onChange={(e) => setEditForm({ ...editForm, assigned_to: e.target.value })} className={formCls}>
+                  <option value="">Unassigned</option>
+                  {profiles.map(p => <option key={p.id} value={p.id}>{p.full_name}</option>)}
+                </select>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-2 pt-4 border-t border-slate-800">
+              {editTask.status !== "Verified" && (
+                <button 
+                  onClick={() => {
+                    setEvidenceTask(editTask);
+                    setEditTask(null);
+                  }} 
+                  className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-medium flex items-center justify-center gap-2"
+                >
+                  <CheckCircle2 size={18} /> Mark Complete / Upload Evidence
+                </button>
+              )}
+              {editTask.status === "To Do" && (
+                <button 
+                  onClick={() => {
+                    updateStatus(editTask.id, "In Progress");
+                    setEditTask(null);
+                  }} 
+                  className="w-full py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-medium flex items-center justify-center gap-2"
+                >
+                  <Clock size={18} /> Start Task
+                </button>
+              )}
+              <button 
+                type="button" 
+                onClick={handleEditSubmit} 
+                disabled={saving} 
+                className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-lg font-medium disabled:opacity-50"
+              >
+                {saving ? <Loader2 className="animate-spin" size={18} /> : "Save Changes"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {evidenceTask && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg shadow-2xl p-6">
+            <h2 className="text-lg font-semibold text-white mb-2">Mark Task Complete</h2>
+            <p className="text-sm text-slate-400 mb-4">
+              {isManager ? "As a Manager, your submission will be automatically verified." : "Upload evidence for your manager to verify."}
+            </p>
+            <form onSubmit={markComplete} className="space-y-4">
+              <div><label className="block text-sm font-medium text-slate-300 mb-1">Evidence Link (Optional)</label><input type="url" value={evidenceLink} onChange={(e) => setEvidenceLink(e.target.value)} className={formCls} /></div>
+              <div><label className="block text-sm font-medium text-slate-300 mb-1">Note (Optional)</label><textarea rows={3} value={evidenceComment} onChange={(e) => setEvidenceComment(e.target.value)} className={formCls} /></div>
+              <div className="flex gap-3 pt-2">
+                <button type="button" onClick={() => setEvidenceTask(null)} className="flex-1 py-2.5 bg-slate-800 text-white rounded-lg font-medium">Cancel</button>
+                <button type="submit" disabled={submittingEvidence} className="flex-1 py-2.5 bg-emerald-600 text-white rounded-lg font-medium disabled:opacity-50">
+                  {submittingEvidence ? <Loader2 className="animate-spin" size={18} /> : (isManager ? "Verify & Complete" : "Submit for Approval")}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {activeTaskForComments && me && (
+        <TaskCommentsModal taskId={activeTaskForComments.id} taskTitle={activeTaskForComments.title} currentUserId={me.id} onClose={() => { setActiveTaskForComments(null); fetchAll(); }} />
+      )}
+
+      {showTimelineModal && needsTimeline.length > 0 && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl shadow-2xl p-6">
+            <h2 className="text-lg font-semibold text-white mb-2">Timeline Needed</h2>
+            <p className="text-sm text-slate-400 mb-4">The following tasks have no period or date. Please assign them so they can be scheduled.</p>
+            <div className="max-h-60 overflow-y-auto space-y-3 mb-6">
+              {needsTimeline.map(n => (
+                <div key={n.id} className="flex items-center gap-4 bg-slate-950 p-3 rounded-lg border border-slate-800">
+                  <span className="flex-1 text-sm text-slate-200 truncate">{n.title}</span>
+                  <select value={timelineDraft[n.id]?.period || "Q1"} onChange={(e) => setTimelineDraft(prev => ({ ...prev, [n.id]: { ...prev[n.id], period: e.target.value as TaskPeriod } }))} className="bg-slate-800 text-sm text-white p-1 rounded">
+                    {PERIODS.filter(p => p !== "N/A").map(p => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                  <input type="date" value={timelineDraft[n.id]?.due_date || ""} onChange={(e) => setTimelineDraft(prev => ({ ...prev, [n.id]: { ...prev[n.id], due_date: e.target.value } }))} className="bg-slate-800 text-sm text-white p-1 rounded" />
+                </div>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setShowTimelineModal(false)} className="px-4 py-2 text-sm text-slate-300 hover:text-white">Cancel</button>
+              <button onClick={applyTimelineDrafts} className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-500">Save & Schedule</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

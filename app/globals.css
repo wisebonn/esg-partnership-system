@@ -24,3 +24,35 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* --- PRINT OVERRIDES --- */
+@media print {
+  /* Force everything to white background and black text */
+  body, main, div, section {
+    background-color: white !important;
+    color: black !important;
+  }
+
+  /* Remove dark backgrounds from cards */
+  .bg-slate-900\/80, .bg-slate-900, .bg-slate-950, .bg-slate-800 {
+    background-color: white !important;
+    border: 1px solid #d1d5db !important; /* gray-300 */
+  }
+
+  /* Ensure text is black */
+  p, span, h1, h2, h3, h4, div {
+    color: black !important;
+  }
+
+  /* Hide the sidebar and header */
+  aside, header {
+    display: none !important;
+  }
+  
+  /* Ensure the main content takes up the full page */
+  main {
+    padding: 0 !important;
+    margin: 0 !important;
+    overflow: visible !important;
+  }
+}
