@@ -36,12 +36,7 @@ const inputCls = "w-full bg-slate-950 border border-slate-800 rounded-lg py-1.5 
 const formCls = "w-full bg-slate-950 border border-slate-800 rounded-lg py-2.5 px-4 text-white focus:outline-none focus:border-blue-500";
 
 const PHASE_ORDER: Record<string, number> = {
-  "Assessment": 1,
-  "Procurement": 2,
-  "Installation": 3,
-  "Commissioning": 4,
-  "Reconciliation": 5,
-  "Unassigned": 6
+  "Assessment": 1, "Procurement": 2, "Installation": 3, "Commissioning": 4, "Reconciliation": 5, "Unassigned": 6
 };
 
 function dupKey(title: string, period: string | null): string {
@@ -198,7 +193,6 @@ function PlanContent() {
       setProfiles(uniqueList); setMe(userId ? uniqueList.find((p) => p.id === userId) ?? null : null);
     }
     
-    // FETCH TASKS WITH PROJECT NAME
     const taskRes = await supabase.from("tasks").select(`*, project:projects(name)`).order("created_at", { ascending: false });
     if (!taskRes.error) {
       const mappedTasks = (taskRes.data as any[]).map(t => ({
@@ -234,7 +228,6 @@ function PlanContent() {
 
   useEffect(() => { fetchAll(); }, []);
 
-  // AUTO-OPEN TASK FROM DEEP LINK
   useEffect(() => {
     if (taskIdParam && tasks.length > 0) {
       const foundTask = tasks.find(t => t.id === taskIdParam);
@@ -395,7 +388,7 @@ function PlanContent() {
 
   const closeTaskModal = () => {
     setEditTask(null);
-    router.replace("/dashboard/plan"); // Clears deep link query param to stop loop
+    router.replace("/dashboard/plan");
   };
 
   const updateStatus = async (id: string, status: string) => { setError(null); const { error: upErr } = await supabase.from("tasks").update({ status }).eq("id", id); if (upErr) setError(upErr.message); fetchAll(); };
@@ -460,7 +453,15 @@ function PlanContent() {
       if (result.needsTimeline.length > 0) {
         setNeedsTimeline(result.needsTimeline);
         const draft: Record<string, { period: TaskPeriod; due_date: string }> = {};
-        for (const n of result.needsTimeline) draft[n.id] = { period: "Q1", due_date: "" };
+        
+        for (const n of result.needsTimeline) {
+          const originalTask = tasks.find(t => t.id === n.id);
+          draft[n.id] = { 
+            period: (originalTask?.period as TaskPeriod) || "Q1", 
+            due_date: originalTask?.due_date || "" 
+          };
+        }
+        
         setTimelineDraft(draft);
         setShowTimelineModal(true);
       }
@@ -472,13 +473,26 @@ function PlanContent() {
   const applyTimelineDrafts = async () => {
     for (const n of needsTimeline) {
       const d = timelineDraft[n.id];
-      if (!d || !d.due_date) continue;
-      await supabase.from("tasks").update({ period: d.period, due_date: d.due_date }).eq("id", n.id);
+      if (!d) continue;
+
+      let finalDate = d.due_date;
+      
+      if (!finalDate && d.period) {
+        const year = 2027;
+        if (d.period === "Q1") finalDate = `${year}-03-31`;
+        else if (d.period === "Q2") finalDate = `${year}-06-30`;
+        else if (d.period === "Q3") finalDate = `${year}-09-30`;
+        else if (d.period === "Q4") finalDate = `${year}-12-31`;
+      }
+
+      if (!finalDate) continue; 
+      
+      await supabase.from("tasks").update({ period: d.period, due_date: finalDate }).eq("id", n.id);
     }
     setShowTimelineModal(false);
     setNeedsTimeline([]);
     setTimelineDraft({});
-    setNotice("Timeline saved.");
+    setNotice("Timeline saved and tasks distributed.");
     fetchAll();
   };
 
@@ -489,21 +503,31 @@ function PlanContent() {
     fetchAll();
   };
 
+  // --- FIXED FILTER LOGIC HERE ---
   const filtered = useMemo(() => {
     let result = tasks;
+
+    // 1. Filter out structural items
+    result = result.filter(t => ["plan", "project", "ad_hoc"].includes(t.task_type || ""));
+
+    // 2. Personal Calendar view filter
     if (view === "calendar" && calendarMode === "personal") {
       result = result.filter(t => t.assigned_to === me?.id);
     }
+    
+    // 3. Apply dropdown filters
     return result.filter((t) => {
       if (taskTypeFilter !== "all" && t.task_type !== taskTypeFilter) return false;
+      
       if (filters.status !== "all" && t.status !== filters.status) return false;
-      if (filters.assignee !== "all" && calendarMode === "team") {
-        if (t.assigned_to !== filters.assignee) return false;
-      }
+      
+      if (filters.assignee !== "all" && t.assigned_to !== filters.assignee) return false;
+      
       if (filters.period !== "all") {
         const p = (t.period || "N/A").toUpperCase();
         if (p !== filters.period) return false;
       }
+      
       return true;
     }).sort((a, b) => {
       const timeA = getTimelineColor(a); const timeB = getTimelineColor(b);
@@ -517,8 +541,8 @@ function PlanContent() {
       return 0;
     });
   }, [tasks, filters, taskTypeFilter, view, calendarMode, me]);
+  // --- END FIXED FILTER LOGIC ---
 
-  // GROUPING LOGIC FOR LIST VIEW
   const groupedTasks = useMemo(() => {
     if (taskTypeFilter !== "project" && taskTypeFilter !== "all") return { "All Tasks": filtered };
     const groups: Record<string, Task[]> = {};

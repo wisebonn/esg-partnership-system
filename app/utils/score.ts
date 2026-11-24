@@ -14,7 +14,7 @@ export type TaskLite = {
   assigned_to: string | null;
   project_id: string | null;
   task_type: string | null;
-  greenwash_overridden?: boolean | null; // NEW FIELD
+  greenwash_overridden?: boolean | null;
 };
 
 export type EvidenceLite = {
@@ -64,7 +64,6 @@ export function isGreenwashing(
   task: Pick<TaskLite, "status" | "greenwash_overridden">,
   hasVerifiedEvidence: boolean
 ): boolean {
-  // If the manager explicitly overrode the greenwash flag, it is NO LONGER greenwashing
   if (task.greenwash_overridden === true) return false;
   
   return task.status === "Verified" && !hasVerifiedEvidence;
@@ -84,13 +83,16 @@ export function weightedScore(
   evidenceByTaskId: Record<string, EvidenceLite[]>,
   filter?: (task: TaskLite) => boolean
 ): ScoreResult {
-  const scoped = filter ? tasks.filter(filter) : tasks;
+  // FIX: Department score ONLY counts 'plan' tasks
+  const scoped = tasks.filter(t => t.task_type === "plan");
+  const filtered = filter ? scoped.filter(filter) : scoped;
+
   let totalWeight = 0;
   let verifiedWeight = 0;
   let verifiedCount = 0;
   let greenwashedCount = 0;
 
-  for (const t of scoped) {
+  for (const t of filtered) {
     const w = t.weight ?? 1;
     totalWeight += w;
 
@@ -98,7 +100,6 @@ export function weightedScore(
     const hasVerified = evidence.some((e) => e.verified_by_manager === true);
     const isOverridden = t.greenwash_overridden === true;
 
-    // If overridden, we treat it as verified for scoring purposes
     if ((t.status === "Verified" && hasVerified) || isOverridden) {
       verifiedWeight += w;
       verifiedCount += 1;
@@ -113,7 +114,7 @@ export function weightedScore(
     score: Math.round(score * 10) / 10,
     totalWeight,
     verifiedWeight,
-    taskCount: scoped.length,
+    taskCount: filtered.length,
     verifiedCount,
     greenwashedCount,
   };
@@ -124,7 +125,40 @@ export function individualScore(
   evidenceByTaskId: Record<string, EvidenceLite[]>,
   userId: string
 ): ScoreResult {
-  return weightedScore(tasks, evidenceByTaskId, (t) => t.assigned_to === userId);
+  // FIX: Individual score counts ALL task types (plan, project, ad_hoc) assigned to the user
+  const myTasks = tasks.filter((t) => t.assigned_to === userId);
+  
+  let totalWeight = 0;
+  let verifiedWeight = 0;
+  let verifiedCount = 0;
+  let greenwashedCount = 0;
+
+  for (const t of myTasks) {
+    const w = t.weight ?? 1;
+    totalWeight += w;
+
+    const evidence = evidenceByTaskId[t.id] ?? [];
+    const hasVerified = evidence.some((e) => e.verified_by_manager === true);
+    const isOverridden = t.greenwash_overridden === true;
+
+    if ((t.status === "Verified" && hasVerified) || isOverridden) {
+      verifiedWeight += w;
+      verifiedCount += 1;
+    } else if (t.status === "Verified" && !hasVerified) {
+      greenwashedCount += 1;
+    }
+  }
+
+  const score = totalWeight === 0 ? 0 : (verifiedWeight / totalWeight) * 100;
+
+  return {
+    score: Math.round(score * 10) / 10,
+    totalWeight,
+    verifiedWeight,
+    taskCount: myTasks.length,
+    verifiedCount,
+    greenwashedCount,
+  };
 }
 
 export function periodPredicate(

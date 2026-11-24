@@ -116,17 +116,27 @@ export default function AuditPage() {
     });
   }, [tasks, evidenceByTaskId, predicate, profiles]);
 
+  // FIXED: Filter logic now correctly stacks the status filters and the search query
   const filteredRows = useMemo(() => {
     let result = rows;
+    
+    // 1. Apply the status filter tabs first
+    if (filter === "pending") result = result.filter((r) => r.flag === "pending");
+    else if (filter === "greenwash") result = result.filter((r) => r.flag === "greenwash");
+    else if (filter === "overdue") result = result.filter((r) => r.flag === "overdue");
+    else if (filter === "verified") result = result.filter((r) => r.flag === "verified");
+    // "all" shows everything
+    
+    // 2. Apply the search query on top of the filtered results
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
-      result = result.filter(r => r.title.toLowerCase().includes(q) || r.assignee_name.toLowerCase().includes(q));
+      result = result.filter(r => 
+        r.title.toLowerCase().includes(q) || 
+        r.assignee_name.toLowerCase().includes(q)
+      );
     }
-    if (filter === "all") return result;
-    if (filter === "pending") return result.filter((r) => r.flag === "pending");
-    if (filter === "greenwash") return result.filter((r) => r.flag === "greenwash");
-    if (filter === "overdue") return result.filter((r) => r.flag === "overdue");
-    return result.filter((r) => r.flag === "verified");
+    
+    return result;
   }, [rows, filter, searchQuery]);
 
   const score = useMemo(() => weightedScore(tasks, evidenceByTaskId, predicate), [tasks, evidenceByTaskId, predicate]);
@@ -157,8 +167,14 @@ export default function AuditPage() {
     setBusyId(taskId); setActionError(null);
     try {
       const unverified = taskEvidence.find(e => e.verified_by_manager !== true);
-      if (unverified) await supabase.from("evidence").update({ verified_by_manager: true }).eq("id", unverified.id);
-      await supabase.from("tasks").update({ status: "Verified" }).eq("id", taskId);
+      if (unverified) {
+        const { error: evError } = await supabase.from("evidence").update({ verified_by_manager: true }).eq("id", unverified.id);
+        if (evError) throw new Error("Evidence update failed: " + evError.message);
+      }
+      
+      const { error: taskError } = await supabase.from("tasks").update({ status: "Verified" }).eq("id", taskId);
+      if (taskError) throw new Error("Task update failed: " + taskError.message);
+
       setSelectedTask(null); setTaskEvidence([]); await refetch();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : "Verification failed.");
@@ -170,7 +186,8 @@ export default function AuditPage() {
     if (!confirm("Are you sure you want to override the greenwash flag? This will mark the task as Verified without system evidence.")) return;
     setBusyId(taskId); setActionError(null);
     try {
-      await supabase.from("tasks").update({ status: "Verified", greenwash_overridden: true }).eq("id", taskId);
+      const { error } = await supabase.from("tasks").update({ status: "Verified", greenwash_overridden: true }).eq("id", taskId);
+      if (error) throw error;
       setSelectedTask(null); await refetch();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : "Override failed.");
@@ -181,10 +198,14 @@ export default function AuditPage() {
     if (!rejectTaskId || !canVerify || !rejectComment.trim()) return;
     setRejecting(true); setActionError(null);
     try {
-      await supabase.from("tasks").update({ status: "In Progress" }).eq("id", rejectTaskId);
-      await supabase.from("task_comments").insert({
+      const { error: taskErr } = await supabase.from("tasks").update({ status: "In Progress" }).eq("id", rejectTaskId);
+      if (taskErr) throw taskErr;
+
+      const { error: comErr } = await supabase.from("task_comments").insert({
         task_id: rejectTaskId, user_id: me?.id, content: rejectComment.trim()
       });
+      if (comErr) throw comErr;
+
       setRejectTaskId(null); setRejectComment(""); setSelectedTask(null); await refetch();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : "Reject failed.");

@@ -4,7 +4,7 @@ import { useEffect, useState, Suspense } from "react";
 import { createClient } from "@/app/utils/supabase";
 import { 
   ChevronLeft, Loader2, Calendar, CheckCircle2, DollarSign, Briefcase, 
-  TrendingUp, Edit, Trash2, X, Save, FileText, Printer, Plus, AlertTriangle, Link as LinkIcon
+  TrendingUp, Edit, Trash2, X, Save, FileText, Printer, Plus, AlertTriangle, Link as LinkIcon, ExternalLink
 } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
@@ -12,9 +12,11 @@ import { useParams, useRouter } from "next/navigation";
 type Project = {
   id: string; name: string; project_type: string; status: string; start_date: string; target_end_date: string;
   interventions: string[]; tie_to_plan: boolean; period: string | null; partner?: { name: string } | null;
+  bc_job_link: string | null; bc_job_number: string | null;
 };
 type Site = { id: string; name: string; location: string; approved_quote: number; actual_spend: number; c_cost: number; partner_revenue: number; };
 type Task = { id: string; title: string; status: string; phase?: string | null; weight: number; period: string | null; assigned_to?: string | null; };
+type Evidence = { id: string; task_id: string; evidence_link: string | null; file_url: string | null; };
 type Profile = { id: string; full_name: string | null };
 
 const PHASES = ["Assessment", "Procurement", "Installation", "Commissioning", "Reconciliation"];
@@ -39,6 +41,7 @@ function ProjectDetailsContent() {
   const [project, setProject] = useState<Project | null>(null);
   const [sites, setSites] = useState<Site[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showReport, setShowReport] = useState(false);
@@ -65,7 +68,15 @@ function ProjectDetailsContent() {
     if (sData) setSites(sData as Site[]);
 
     const { data: tData } = await supabase.from("tasks").select("id, title, status, phase, weight, period, assigned_to").eq("project_id", id).order("created_at", { ascending: true });
-    if (tData) setTasks(tData as Task[]);
+    if (tData) {
+      setTasks(tData as Task[]);
+      // Fetch evidence for these tasks
+      const taskIds = tData.map(t => t.id);
+      if (taskIds.length > 0) {
+        const { data: evData } = await supabase.from("evidence").select("id, task_id, evidence_link, file_url").in("task_id", taskIds);
+        if (evData) setEvidence(evData as Evidence[]);
+      }
+    }
 
     const { data: pData } = await supabase.from("profiles").select("id, full_name");
     if (pData) setProfiles(pData);
@@ -78,7 +89,13 @@ function ProjectDetailsContent() {
   // --- ACTIONS ---
   const handleUpdateProject = async (e: React.FormEvent) => {
     e.preventDefault(); setSaving(true);
-    await supabase.from("projects").update({ name: editProjectForm.name, start_date: editProjectForm.start_date, target_end_date: editProjectForm.target_end_date }).eq("id", id);
+    await supabase.from("projects").update({ 
+      name: editProjectForm.name, 
+      start_date: editProjectForm.start_date, 
+      target_end_date: editProjectForm.target_end_date,
+      bc_job_link: editProjectForm.bc_job_link,
+      bc_job_number: editProjectForm.bc_job_number
+    }).eq("id", id);
     setIsEditProjectOpen(false); fetchData(); setSaving(false);
   };
 
@@ -120,7 +137,6 @@ function ProjectDetailsContent() {
       weight: editingTask.weight || 2,
       status: editingTask.status || "To Do",
       assigned_to: editingTask.assigned_to || null,
-      // Inherit plan period if tied
       period: project?.tie_to_plan ? project.period : null 
     };
 
@@ -154,7 +170,6 @@ function ProjectDetailsContent() {
     const budgetPercent = totalBudget > 0 ? Math.round((totalCost / totalBudget) * 100) : 0;
     const isOverBudget = totalCost > totalBudget;
     
-    // RAG Logic
     const scopeRag = scopePercent === 100 ? "green" : scopePercent >= 50 ? "amber" : "red";
     const budgetRag = isOverBudget ? "red" : budgetPercent >= 90 ? "amber" : "green";
     const isPastDue = project.target_end_date && new Date(project.target_end_date) < new Date();
@@ -285,8 +300,6 @@ function ProjectDetailsContent() {
   const profit = totalRevenue - totalCCost;
   const margin = totalRevenue > 0 ? (profit / totalRevenue) * 100 : 0;
 
-  // --- RECONCILIATION LOCK LOGIC ---
-  // A site must have an actual_spend greater than 0 to be considered "costed"
   const allSitesHaveCost = sites.length > 0 && sites.every(s => Number(s.actual_spend) > 0);
 
   const phaseProgress = PHASES.map(phase => {
@@ -297,7 +310,6 @@ function ProjectDetailsContent() {
     let isLocked = false;
     if (phase === "Reconciliation" && !allSitesHaveCost) {
       isLocked = true;
-      // Visually force the bar to not show 100% if sites aren't reconciled
       if (completed === total && total > 0) completed = total - 1; 
     }
 
@@ -311,6 +323,11 @@ function ProjectDetailsContent() {
           <ChevronLeft size={16} /> Back to Projects
         </Link>
         <div className="flex items-center gap-2">
+          {project.bc_job_link && (
+            <a href={project.bc_job_link} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1 bg-blue-500/10 px-3 py-1.5 rounded-lg border border-blue-500/20">
+              <ExternalLink size={14} /> BC Job: {project.bc_job_number || "Link"}
+            </a>
+          )}
           <button onClick={() => setShowReport(true)} className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1 bg-blue-500/10 px-3 py-1.5 rounded-lg border border-blue-500/20">
             <FileText size={14} /> Generate Report
           </button>
@@ -388,21 +405,31 @@ function ProjectDetailsContent() {
                 <div key={phase.name}>
                   <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2 border-b border-slate-800 pb-1">{phase.name}</h3>
                   <div className="space-y-2">
-                    {phase.tasks.map((t, index) => (
-                      <div key={t.id} className="flex flex-col gap-2 p-3 bg-slate-950 border border-slate-800 rounded-lg hover:border-blue-500/30 transition-colors group">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-3">
-                            <span className="w-5 h-5 rounded-full bg-slate-800 text-slate-400 text-xs flex items-center justify-center font-bold">{index + 1}</span>
-                            <span className="text-sm text-slate-200">{t.title}</span>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <span className={`text-[10px] px-2 py-1 rounded-full ${t.status === "Verified" ? "bg-emerald-500/20 text-emerald-400" : "bg-slate-800 text-slate-400"}`}>{t.status}</span>
-                            <button onClick={() => { setEditingTask(t); setIsTaskModalOpen(true); }} className="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-blue-400"><Edit size={12}/></button>
-                            <button onClick={() => handleDeleteTask(t.id)} className="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-red-400"><Trash2 size={12}/></button>
+                    {phase.tasks.map((t, index) => {
+                      const taskEvidence = evidence.find(ev => ev.task_id === t.id);
+                      const evidenceLink = taskEvidence?.evidence_link || taskEvidence?.file_url;
+
+                      return (
+                        <div key={t.id} className="flex flex-col gap-2 p-3 bg-slate-950 border border-slate-800 rounded-lg hover:border-blue-500/30 transition-colors group">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                              <span className="w-5 h-5 rounded-full bg-slate-800 text-slate-400 text-xs flex items-center justify-center font-bold">{index + 1}</span>
+                              <span className="text-sm text-slate-200">{t.title}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {evidenceLink && (
+                                <a href={evidenceLink} target="_blank" rel="noopener noreferrer" className="text-[10px] bg-blue-500/10 text-blue-400 px-2 py-1 rounded-full flex items-center gap-1 hover:bg-blue-500/20">
+                                  <LinkIcon size={10} /> Evidence
+                                </a>
+                              )}
+                              <span className={`text-[10px] px-2 py-1 rounded-full ${t.status === "Verified" ? "bg-emerald-500/20 text-emerald-400" : "bg-slate-800 text-slate-400"}`}>{t.status}</span>
+                              <button onClick={() => { setEditingTask(t); setIsTaskModalOpen(true); }} className="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-blue-400"><Edit size={12}/></button>
+                              <button onClick={() => handleDeleteTask(t.id)} className="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-red-400"><Trash2 size={12}/></button>
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )
@@ -541,6 +568,10 @@ function ProjectDetailsContent() {
               <div><label className={labelCls}>Project Name</label><input required value={editProjectForm.name || ""} onChange={e => setEditProjectForm({...editProjectForm, name: e.target.value})} className={formCls} /></div>
               <div><label className={labelCls}>Start Date</label><input type="date" value={editProjectForm.start_date || ""} onChange={e => setEditProjectForm({...editProjectForm, start_date: e.target.value})} className={formCls} /></div>
               <div><label className={labelCls}>Target End Date</label><input type="date" value={editProjectForm.target_end_date || ""} onChange={e => setEditProjectForm({...editProjectForm, target_end_date: e.target.value})} className={formCls} /></div>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className={labelCls}>BC Job Link</label><input value={editProjectForm.bc_job_link || ""} onChange={e => setEditProjectForm({...editProjectForm, bc_job_link: e.target.value})} className={formCls} /></div>
+                <div><label className={labelCls}>BC Job Number</label><input value={editProjectForm.bc_job_number || ""} onChange={e => setEditProjectForm({...editProjectForm, bc_job_number: e.target.value})} className={formCls} /></div>
+              </div>
               <button type="submit" disabled={saving} className="w-full py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-medium flex justify-center items-center gap-2">
                 {saving ? <Loader2 className="animate-spin" size={18}/> : <><Save size={18}/> Save Changes</>}
               </button>

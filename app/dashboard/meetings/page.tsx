@@ -122,7 +122,7 @@ export default function MeetingsPage() {
   const openNewModal = () => {
     setExtractedMeeting({
       title: "", date: new Date().toISOString().slice(0, 10), summary: "", 
-      category: "Internal Sync", project_id: "", goal_id: "", partner_id: "",
+      category: "Internal Business", project_id: "", goal_id: "", partner_id: "",
       is_recurring: false, recurrence_rule: "weekly"
     });
     setExtractedTasks([]);
@@ -134,7 +134,7 @@ export default function MeetingsPage() {
   const openEditModal = (m: Meeting) => {
     setExtractedMeeting({
       title: m.title, date: m.date || "", summary: m.minutes_summary || "", 
-      category: m.category || "Internal Sync", project_id: m.project_id || "", 
+      category: m.category || "Internal Business", project_id: m.project_id || "", 
       goal_id: m.goal_id || "", partner_id: m.partner_id || "",
       is_recurring: m.is_recurring || false, recurrence_rule: m.recurrence_rule || "weekly"
     });
@@ -152,7 +152,7 @@ export default function MeetingsPage() {
         title: data.title,
         date: data.date || "",
         summary: data.summary,
-        category: data.category,
+        category: data.category === "Internal Sync" ? "Internal Business" : data.category,
         project_id: "",
         goal_id: "",
         partner_id: "",
@@ -320,7 +320,7 @@ export default function MeetingsPage() {
 
       {/* FILTER PILLS */}
       <div className="flex gap-2">
-        {["Partner Meeting", "Project Meeting", "Plan Meeting", "Internal Sync"].map(cat => (
+        {["Partner Meeting", "Project Meeting", "Plan Meeting", "Internal Business"].map(cat => (
           <button key={cat} onClick={() => setFilterCategory(filterCategory === cat ? null : cat)} className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition ${filterCategory === cat ? "bg-blue-600 text-white border-blue-500" : "bg-slate-900 text-slate-400 border-slate-800 hover:text-white"}`}>
             {cat}
           </button>
@@ -483,7 +483,7 @@ export default function MeetingsPage() {
                           <option value="Partner Meeting">Partner Meeting</option>
                           <option value="Project Meeting">Project Meeting</option>
                           <option value="Plan Meeting">Plan Meeting</option>
-                          <option value="Internal Sync">Internal Sync</option>
+                          <option value="Internal Business">Internal Business</option>
                         </select>
                       </div>
                       

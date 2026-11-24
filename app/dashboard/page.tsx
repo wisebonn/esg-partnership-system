@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { usePathname } from "next/navigation"; // <-- ADDED IMPORT
 import {
   Activity, ArrowUpRight, CheckCircle2, Clock, Loader2, ShieldAlert, TrendingUp, Users,
 } from "lucide-react";
@@ -24,6 +25,8 @@ type Partner = { id: string; category: string | null; };
 
 export default function DashboardPage() {
   const supabase = createClient();
+  const pathname = usePathname(); // <-- ADDED PATHNAME
+  
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [tasks, setTasks] = useState<TaskLite[]>([]);
@@ -70,9 +73,10 @@ export default function DashboardPage() {
     }
   }, [supabase]);
 
+  // FIXED: Added pathname to dependency array to trigger refetch on router.refresh()
   useEffect(() => {
     fetchData();
-  }, [fetchData]);
+  }, [fetchData, pathname]);
 
   useRealtimeSync();
 
@@ -88,12 +92,12 @@ export default function DashboardPage() {
   const predicate = useMemo(() => periodPredicate(period), [period]);
   const deptScore: ScoreResult = useMemo(() => weightedScore(tasks, evidenceByTaskId, predicate), [tasks, evidenceByTaskId, predicate]);
 
-  // AUTO-SNAPSHOT GENERATOR: Ensures the trend graph actually gets data
+  // AUTO-SNAPSHOT GENERATOR
   useEffect(() => {
     async function saveSnapshot() {
       if (loading || deptScore.score === 0) return;
       
-      const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+      const today = new Date().toISOString().split("T")[0];
       const existing = snapshots.find(s => 
         s.period === period && 
         s.captured_at.startsWith(today)
@@ -104,16 +108,17 @@ export default function DashboardPage() {
           period: period,
           scope: "department",
           score: deptScore.score,
-          captured_at: new Date().toISOString()
+          captured_at: new Date().toISOString(),
+          total_weight: deptScore.totalWeight,
+          verified_weight: deptScore.verifiedWeight
         });
-        // Silent refetch to update the graph
+        
         const { data } = await supabase.from("score_snapshots").select("*").eq("scope", "department").order("captured_at", { ascending: true });
         if (data) setSnapshots(data as Snapshot[]);
       }
     }
     saveSnapshot();
-  }, [deptScore.score, period, loading, snapshots, supabase]);
-
+  }, [deptScore.score, deptScore.totalWeight, deptScore.verifiedWeight, period, loading, snapshots, supabase]);
 
   const greenwashedTasks = useMemo(() => {
     return tasks.filter((t) => {
@@ -269,7 +274,6 @@ export default function DashboardPage() {
 function Sparkline({ points, labels }: { points: number[]; labels: string[] }) {
   const width = 240; const height = 60; const pad = 6;
   
-  // If only one point, draw a flat line in the middle
   if (points.length === 1) {
     return (
       <div className="mt-3">

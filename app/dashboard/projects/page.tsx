@@ -49,7 +49,7 @@ export default function ProjectsPage() {
   
   const [form, setForm] = useState({ 
     name: "", project_type: "CSR Project", partner_id: "", start_date: "", target_end_date: "", 
-    bc_job_link: "", mou_link: "", csr_agreement_link: "", interventions: [] as string[], 
+    bc_job_link: "", bc_job_number: "", mou_link: "", csr_agreement_link: "", interventions: [] as string[], 
     generate_tasks: true, tie_to_plan: false, period: "Q1"
   });
   
@@ -96,7 +96,8 @@ export default function ProjectsPage() {
     const { data: newProject, error: projErr } = await supabase.from("projects").insert({
       name: form.name, project_type: form.project_type, partner_id: form.partner_id || null,
       start_date: form.start_date || null, target_end_date: form.target_end_date || null,
-      bc_job_link: form.bc_job_link || null, mou_link: form.mou_link || null, csr_agreement_link: form.csr_agreement_link || null,
+      bc_job_link: form.bc_job_link || null, bc_job_number: form.bc_job_number || null,
+      mou_link: form.mou_link || null, csr_agreement_link: form.csr_agreement_link || null,
       interventions: form.interventions, status: "Planning",
       tie_to_plan: form.tie_to_plan, period: form.tie_to_plan ? form.period : null
     }).select("id").single();
@@ -126,7 +127,7 @@ export default function ProjectsPage() {
 
     setNotice("Project, sites, and automated tasks created successfully!");
     setIsModalOpen(false);
-    setForm({ name: "", project_type: "CSR Project", partner_id: "", start_date: "", target_end_date: "", bc_job_link: "", mou_link: "", csr_agreement_link: "", interventions: [], generate_tasks: true, tie_to_plan: false, period: "Q1" });
+    setForm({ name: "", project_type: "CSR Project", partner_id: "", start_date: "", target_end_date: "", bc_job_link: "", bc_job_number: "", mou_link: "", csr_agreement_link: "", interventions: [], generate_tasks: true, tie_to_plan: false, period: "Q1" });
     setSites([]); fetchProjects(); setSaving(false);
   };
 
@@ -200,6 +201,10 @@ export default function ProjectsPage() {
                 <div className="grid grid-cols-2 gap-4">
                   <div><label className={labelCls}>Start Date</label><input type="date" value={form.start_date} onChange={e => setForm({...form, start_date: e.target.value})} className={formCls} /></div>
                   <div><label className={labelCls}>Target End Date</label><input type="date" value={form.target_end_date} onChange={e => setForm({...form, target_end_date: e.target.value})} className={formCls} /></div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div><label className={labelCls}>BC Job Link (Optional)</label><input value={form.bc_job_link} onChange={e => setForm({...form, bc_job_link: e.target.value})} className={formCls} placeholder="https://..." /></div>
+                  <div><label className={labelCls}>BC Job Number (Optional)</label><input value={form.bc_job_number} onChange={e => setForm({...form, bc_job_number: e.target.value})} className={formCls} placeholder="e.g. BC-1024" /></div>
                 </div>
               </div>
 

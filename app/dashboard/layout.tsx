@@ -6,9 +6,8 @@ import { usePathname, useRouter } from "next/navigation";
 import { createClient } from "@/app/utils/supabase";
 import {
   LayoutDashboard, Target, FolderKanban, Users, CalendarCheck, ShieldCheck,
-  LogOut, Menu, X, Settings
+  LogOut, Menu, X, Settings, Globe, FileText
 } from "lucide-react";
-import { FileText } from "lucide-react";
 
 const navItems = [
   { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
@@ -16,9 +15,10 @@ const navItems = [
   { name: "Projects", href: "/dashboard/projects", icon: FolderKanban },
   { name: "Partners (CRM)", href: "/dashboard/partners", icon: Users },
   { name: "Meetings", href: "/dashboard/meetings", icon: CalendarCheck },
+  { name: "Flagship Initiatives", href: "/dashboard/flagship", icon: Globe }, // <-- NEW LINK ADDED HERE
   { name: "Audit Center", href: "/dashboard/audit", icon: ShieldCheck },
-  { name: "Settings", href: "/dashboard/settings", icon: Settings },
   { name: "Monday Reports", href: "/dashboard/reports", icon: FileText },
+  { name: "Settings", href: "/dashboard/settings", icon: Settings },
 ];
 
 function SidebarNav() {
