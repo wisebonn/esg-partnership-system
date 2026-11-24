@@ -7,7 +7,9 @@ import Link from "next/link";
 
 type Project = {
   id: string; name: string; project_type: string | null; status: string | null;
-  start_date: string | null; target_end_date: string | null; bc_job_link: string | null;
+  start_date: string | null; target_end_date: string | null; 
+  bc_job_link: string | null; 
+  bc_job_number: string | null;
   interventions: string[] | null; tie_to_plan: boolean; period: string | null; partner?: { name: string } | null;
 };
 
@@ -60,7 +62,8 @@ export default function ProjectsPage() {
     const { data: partData } = await supabase.from("partners").select("id, name").order("name");
     if (partData) setPartners(partData);
 
-    const { data: projData, error: projErr } = await supabase.from("projects").select(`id, name, project_type, status, start_date, target_end_date, bc_job_link, interventions, tie_to_plan, period, partner:partners(name)`);
+    // Fetches bc_job_link and bc_job_number from DB
+    const { data: projData, error: projErr } = await supabase.from("projects").select(`id, name, project_type, status, start_date, target_end_date, bc_job_link, bc_job_number, interventions, tie_to_plan, period, partner:partners(name)`);
     if (projErr) setError(projErr.message);
     else if (projData) setProjects(projData as unknown as Project[]);
     setLoading(false);
@@ -93,6 +96,7 @@ export default function ProjectsPage() {
     const { data: { session } } = await supabase.auth.getSession();
     const userId = session?.user?.id;
 
+    // Saves bc_job_link and bc_job_number to DB
     const { data: newProject, error: projErr } = await supabase.from("projects").insert({
       name: form.name, project_type: form.project_type, partner_id: form.partner_id || null,
       start_date: form.start_date || null, target_end_date: form.target_end_date || null,
